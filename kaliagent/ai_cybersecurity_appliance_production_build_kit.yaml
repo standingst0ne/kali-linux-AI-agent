@@ -1,0 +1,221 @@
+# ============================================================
+# AI CYBERSECURITY APPLIANCE (CLIENT-FACING)
+# FULL DOCKER COMPOSE STACK
+# ============================================================
+
+version: '3.9'
+
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - control_net
+
+  broker:
+    build: ./broker
+    container_name: broker
+    restart: unless-stopped
+    networks:
+      - control_net
+      - sandbox_net
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  planner:
+    build: ./agents/planner
+    networks:
+      - control_net
+
+  executor:
+    build: ./agents/executor
+    networks:
+      - control_net
+
+  auditor:
+    build: ./agents/auditor
+    networks:
+      - control_net
+
+  ui:
+    build: ./ui
+    ports:
+      - "3000:3000"
+    networks:
+      - control_net
+
+  nmap:
+    build: ./tools/nmap
+    networks:
+      - sandbox_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  dvwa:
+    image: vulnerables/web-dvwa
+    networks:
+      - target_net
+
+  juice_shop:
+    image: bkimminich/juice-shop
+    networks:
+      - target_net
+
+networks:
+  control_net:
+    driver: bridge
+  sandbox_net:
+    driver: bridge
+    internal: true
+  target_net:
+    driver: bridge
+    internal: true
+
+volumes:
+  ollama_data:
+
+# ============================================================
+# FIREWALL RULES (HOST - IPTABLES)
+# ============================================================
+# Copy/paste on host
+
+# Default deny
+iptables -P OUTPUT DROP
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+
+# Allow localhost
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow UI access
+iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
+
+# Allow broker local
+iptables -A INPUT -p tcp --dport 8080 -s 127.0.0.1 -j ACCEPT
+
+# Allow Docker internal
+iptables -A FORWARD -i docker0 -o docker0 -j ACCEPT
+
+# ============================================================
+# BROKER (./broker/app.py)
+# ============================================================
+
+# Minimal hardened broker
+
+"""
+from flask import Flask, request, jsonify
+import subprocess, json
+
+app = Flask(__name__)
+
+ALLOWED = {
+  "nmap": ["-sV","-Pn"]
+}
+
+@app.route('/run', methods=['POST'])
+def run():
+    cmd = request.json
+
+    tool = cmd.get("tool")
+    args = cmd.get("args", [])
+
+    if tool not in ALLOWED:
+        return jsonify({"error":"tool not allowed"}), 403
+
+    for a in args:
+        if a.startswith("-") and a not in ALLOWED[tool]:
+            return jsonify({"error":"bad arg"}), 403
+
+    result = subprocess.run([tool]+args, capture_output=True, text=True, timeout=30)
+    return jsonify({"output": result.stdout[:2000]})
+
+app.run(host='0.0.0.0', port=8080)
+"""
+
+# ============================================================
+# MULTI-AGENT SYSTEM (planner example)
+# ============================================================
+
+# ./agents/planner/app.py
+
+"""
+import requests, subprocess, json
+
+BROKER = "http://broker:8080/run"
+
+
+def ask_llm(prompt):
+    r = subprocess.run(["ollama","run","mistral"], input=prompt, text=True, capture_output=True)
+    return r.stdout
+
+while True:
+    task = input("Task: ")
+
+    plan = ask_llm(f"Return JSON tool command for: {task}")
+
+    try:
+        cmd = json.loads(plan)
+    except:
+        print("Invalid plan")
+        continue
+
+    print("Plan:", cmd)
+"""
+
+# ============================================================
+# TOOL CONTAINER (./tools/nmap/Dockerfile)
+# ============================================================
+
+FROM alpine:latest
+RUN apk add --no-cache nmap
+RUN adduser -D tool
+USER tool
+ENTRYPOINT ["nmap"]
+
+# ============================================================
+# WEB UI (./ui/app.js - minimal React)
+# ============================================================
+
+"""
+import React, { useState } from 'react';
+
+export default function App(){
+  const [task,setTask]=useState("");
+  const [out,setOut]=useState("");
+
+  const run = async ()=>{
+    const res = await fetch('/api/run',{method:'POST',body:JSON.stringify({task})});
+    const data = await res.json();
+    setOut(data.output);
+  }
+
+  return (
+    <div>
+      <h1>Cyber AI Appliance</h1>
+      <input value={task} onChange={e=>setTask(e.target.value)} />
+      <button onClick={run}>Run</button>
+      <pre>{out}</pre>
+    </div>
+  )
+}
+"""
+
+# ============================================================
+# KILL SWITCH
+# ============================================================
+
+# kill.sh
+
+docker compose down
+iptables -F
+
+# ============================================================
+# END
+# ============================================================
